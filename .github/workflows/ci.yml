@@ -10,13 +10,24 @@ jobs:
     name: Vet, test, build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      # Lets the queue package tests run against a real Redis.
+      REDIS_URL: redis://localhost:6379
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - run: go vet ./...
-      - run: go test ./... -race -count=1
+      - run: go test ./... -race -count=1 -cover
       - run: CGO_ENABLED=0 go build -trimpath -o /tmp/ingest .
 
   docker:
@@ -31,3 +42,6 @@ jobs:
           context: .
           push: false
           tags: centli-ingest:ci
+          build-args: |
+            VERSION=ci
+            COMMIT=${{ github.sha }}

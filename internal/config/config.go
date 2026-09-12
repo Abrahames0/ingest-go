@@ -12,28 +12,30 @@ import (
 )
 
 type Config struct {
-	Port          string
-	RedisURL      string
-	APIKey        string // same API_KEY as api-fin (x-api-key header)
-	JWTSecret     string // same JWT_ACCESS_SECRET as api-fin (HS256)
-	StreamKey     string // Redis Stream the API consumes
-	StreamMaxLen  int64  // approximate cap on the stream length
-	MaxTextLength int    // characters accepted per notification
-	RatePerMinute int    // per user
-	DedupeTTL     time.Duration
+	Port            string
+	RedisURL        string
+	APIKey          string // same API_KEY as api-fin (x-api-key header)
+	JWTSecret       string // same JWT_ACCESS_SECRET as api-fin (HS256)
+	StreamKey       string // Redis Stream the API consumes
+	StreamMaxLen    int64  // approximate cap on the stream length
+	MaxTextLength   int    // characters accepted per notification
+	RatePerMinute   int    // per user, after authentication
+	IPRatePerMinute int    // per client IP, before authentication (brute-force brake)
+	DedupeTTL       time.Duration
 }
 
 func Load() (Config, error) {
 	cfg := Config{
-		Port:          env("PORT", "8080"),
-		RedisURL:      env("REDIS_URL", "redis://localhost:6379"),
-		APIKey:        os.Getenv("API_KEY"),
-		JWTSecret:     os.Getenv("JWT_ACCESS_SECRET"),
-		StreamKey:     env("CAPTURE_STREAM_KEY", "capture:notifications"),
-		StreamMaxLen:  envInt64("CAPTURE_STREAM_MAXLEN", 50_000),
-		MaxTextLength: envInt("MAX_TEXT_LENGTH", 2000),
-		RatePerMinute: envInt("RATE_PER_MINUTE", 120),
-		DedupeTTL:     24 * time.Hour,
+		Port:            env("PORT", "8080"),
+		RedisURL:        env("REDIS_URL", "redis://localhost:6379"),
+		APIKey:          os.Getenv("API_KEY"),
+		JWTSecret:       os.Getenv("JWT_ACCESS_SECRET"),
+		StreamKey:       env("CAPTURE_STREAM_KEY", "capture:notifications"),
+		StreamMaxLen:    envInt64("CAPTURE_STREAM_MAXLEN", 50_000),
+		MaxTextLength:   envInt("MAX_TEXT_LENGTH", 2000),
+		RatePerMinute:   envInt("RATE_PER_MINUTE", 120),
+		IPRatePerMinute: envInt("IP_RATE_PER_MINUTE", 600),
+		DedupeTTL:       24 * time.Hour,
 	}
 	if cfg.APIKey == "" {
 		return cfg, errors.New("API_KEY is required (same value as api-fin)")
@@ -54,7 +56,7 @@ func LoadDotEnv(path string) error {
 	if err != nil {
 		return err
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue

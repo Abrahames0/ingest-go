@@ -1,5 +1,5 @@
-// Package queue is the Redis side of the service: the per-user rate limit,
-// the early duplicate filter and the stream the API consumes.
+// Package queue is the Redis side of the service: the rate limits, the early
+// duplicate filter, the revoked-token set and the stream the API consumes.
 package queue
 
 import (
@@ -42,9 +42,9 @@ func (e Entry) values() map[string]any {
 // Store is what the HTTP layer needs. Redis implements it; tests fake it.
 type Store interface {
 	Ping(ctx context.Context) error
-	// Allow counts one request for the user in the current minute and reports
-	// whether it is still within limit.
-	Allow(ctx context.Context, userID string, limit int) (bool, error)
+	// Allow counts one hit on the bucket (a user or an IP within a minute,
+	// the caller builds the name) and reports whether it is still within limit.
+	Allow(ctx context.Context, bucket string, limit int) (bool, error)
 	// FirstSeen marks key for ttl and reports whether it was new.
 	FirstSeen(ctx context.Context, key string, ttl time.Duration) (bool, error)
 	// Enqueue appends the entry to the stream and returns its id.
@@ -54,13 +54,31 @@ type Store interface {
 	Close() error
 }
 
+// RevokedSet is the Redis set the API writes revoked capture token ids to.
+const RevokedSet = "capture:revoked"
+
+// Rate-limit buckets are per minute; two minutes of life covers clock skew
+// between instances and lets the key disappear on its own.
+const bucketTTLSeconds = 120
+
+// allowScript increments the bucket and sets its expiry in the same call, so
+// a hit can never leave a counter behind without a TTL.
+var allowScript = redis.NewScript(`
+local n = redis.call('INCR', KEYS[1])
+if n == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return n
+`)
+
 type Redis struct {
 	rdb    *redis.Client
 	stream string
 	maxLen int64
 }
 
-// NewRedis connects lazily; the first command opens the connection.
+// NewRedis parses the URL and builds the client; the first command opens the
+// connection. Callers that want to know early should Ping.
 func NewRedis(url, stream string, maxLen int64) (*Redis, error) {
 	opt, err := redis.ParseURL(url)
 	if err != nil {
@@ -73,14 +91,10 @@ func (r *Redis) Ping(ctx context.Context) error {
 	return r.rdb.Ping(ctx).Err()
 }
 
-func (r *Redis) Allow(ctx context.Context, userID string, limit int) (bool, error) {
-	key := "ingest:rl:" + userID + ":" + time.Now().UTC().Format("200601021504")
-	n, err := r.rdb.Incr(ctx, key).Result()
+func (r *Redis) Allow(ctx context.Context, bucket string, limit int) (bool, error) {
+	n, err := allowScript.Run(ctx, r.rdb, []string{"ingest:rl:" + bucket}, bucketTTLSeconds).Int64()
 	if err != nil {
 		return false, err
-	}
-	if n == 1 {
-		r.rdb.Expire(ctx, key, 2*time.Minute)
 	}
 	return n <= int64(limit), nil
 }
@@ -97,9 +111,6 @@ func (r *Redis) Enqueue(ctx context.Context, e Entry) (string, error) {
 		Values: e.values(),
 	}).Result()
 }
-
-// RevokedSet is the Redis set the API writes revoked capture token ids to.
-const RevokedSet = "capture:revoked"
 
 func (r *Redis) IsRevoked(ctx context.Context, jti string) (bool, error) {
 	return r.rdb.SIsMember(ctx, RevokedSet, jti).Result()

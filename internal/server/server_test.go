@@ -34,12 +34,12 @@ func newFakeStore() *fakeStore {
 
 func (f *fakeStore) Ping(context.Context) error { return f.pingErr }
 
-func (f *fakeStore) Allow(_ context.Context, userID string, limit int) (bool, error) {
+func (f *fakeStore) Allow(_ context.Context, bucket string, limit int) (bool, error) {
 	if f.downErr != nil {
 		return false, f.downErr
 	}
-	f.count[userID]++
-	return f.count[userID] <= limit, nil
+	f.count[bucket]++
+	return f.count[bucket] <= limit, nil
 }
 
 func (f *fakeStore) FirstSeen(_ context.Context, key string, _ time.Duration) (bool, error) {
@@ -72,13 +72,14 @@ var frozen = time.Date(2026, 9, 10, 15, 0, 0, 0, time.UTC)
 
 func newTestServer() (*Server, *fakeStore) {
 	cfg := config.Config{
-		Port:          "0",
-		APIKey:        "api-key",
-		JWTSecret:     secret,
-		StreamKey:     "capture:test",
-		MaxTextLength: 2000,
-		RatePerMinute: 3,
-		DedupeTTL:     time.Hour,
+		Port:            "0",
+		APIKey:          "api-key",
+		JWTSecret:       secret,
+		StreamKey:       "capture:test",
+		MaxTextLength:   2000,
+		RatePerMinute:   3,
+		IPRatePerMinute: 100,
+		DedupeTTL:       time.Hour,
 	}
 	store := newFakeStore()
 	srv := New(cfg, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -295,6 +296,58 @@ func TestBatch(t *testing.T) {
 	}
 }
 
+func TestPayloadTooLarge(t *testing.T) {
+	srv, _ := newTestServer()
+	body := fmt.Sprintf(`{"text":"%s"}`, strings.Repeat("a", maxBody+1))
+	if rec := do(srv, "POST", "/ingest/notification", body, authed("user-1")); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("want 413, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPostedAtTooOld(t *testing.T) {
+	srv, store := newTestServer()
+	old := frozen.Add(-91 * 24 * time.Hour).Format(time.RFC3339)
+	if rec := do(srv, "POST", "/ingest/notification", `{"text":"Compra por $1","postedAt":"`+old+`"}`, authed("user-1")); rec.Code != 400 {
+		t.Fatalf("91 days old: want 400, got %d", rec.Code)
+	}
+	recent := frozen.Add(-30 * 24 * time.Hour).Format(time.RFC3339)
+	if rec := do(srv, "POST", "/ingest/notification", `{"text":"Compra por $1","postedAt":"`+recent+`"}`, authed("user-1")); rec.Code != 202 {
+		t.Fatalf("30 days old: want 202, got %d %s", rec.Code, rec.Body.String())
+	}
+	if len(store.entries) != 1 {
+		t.Fatalf("entries = %d", len(store.entries))
+	}
+}
+
+func TestIPRateLimitRunsBeforeAuth(t *testing.T) {
+	srv, _ := newTestServer()
+	srv.cfg.IPRatePerMinute = 2
+	bad := map[string]string{"x-api-key": "wrong", "X-Forwarded-For": "203.0.113.9, 10.0.0.1"}
+	for i := 0; i < 2; i++ {
+		if rec := do(srv, "POST", "/ingest/notification", `{"text":"x"}`, bad); rec.Code != 401 {
+			t.Fatalf("attempt %d: want 401, got %d", i, rec.Code)
+		}
+	}
+	if rec := do(srv, "POST", "/ingest/notification", `{"text":"x"}`, bad); rec.Code != 429 {
+		t.Fatalf("third attempt from the same address: want 429, got %d", rec.Code)
+	}
+	other := map[string]string{"x-api-key": "wrong", "X-Forwarded-For": "198.51.100.4"}
+	if rec := do(srv, "POST", "/ingest/notification", `{"text":"x"}`, other); rec.Code != 401 {
+		t.Fatalf("another address is not affected: %d", rec.Code)
+	}
+}
+
+func TestHealthReportsVersion(t *testing.T) {
+	srv, _ := newTestServer()
+	Version, Commit = "1.2.3", "abc1234"
+	defer func() { Version, Commit = "dev", "unknown" }()
+	rec := do(srv, "GET", "/healthz", "", nil)
+	body := decodeBody[map[string]any](t, rec)
+	if body["version"] != "1.2.3" || body["commit"] != "abc1234" || body["status"] != "ok" {
+		t.Fatalf("health = %v", body)
+	}
+}
+
 func TestRejectsNonJSON(t *testing.T) {
 	srv, _ := newTestServer()
 	req := httptest.NewRequest("POST", "/ingest/notification", strings.NewReader("text=hola"))
@@ -304,7 +357,7 @@ func TestRejectsNonJSON(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("want 400, got %d", rec.Code)
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("want 415, got %d", rec.Code)
 	}
 }

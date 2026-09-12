@@ -1,4 +1,4 @@
-// Package server is the HTTP layer: API key + JWT, validation, rate limit,
+// Package server is the HTTP layer: API key + JWT, validation, rate limits,
 // duplicate filter, enqueue.
 package server
 
@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -20,10 +21,22 @@ import (
 	"github.com/xonix/centli-ingest/internal/queue"
 )
 
+// Version and Commit are stamped at build time (see Dockerfile) and shown by
+// /healthz so it is always clear what is deployed.
+var (
+	Version = "dev"
+	Commit  = "unknown"
+)
+
 const (
 	maxBody    = 256 << 10 // a batch of 50 notifications of 2 KB fits comfortably
 	maxBatch   = 50
 	timeLayout = "2006-01-02T15:04:05.000Z07:00"
+	// A phone with a wrong clock must not file today's payment under 1970.
+	maxPostedAge = 90 * 24 * time.Hour
+	// Enqueuing a batch keeps going even if the phone drops the connection;
+	// this bounds how long it may take.
+	batchTimeout = 15 * time.Second
 )
 
 type Server struct {
@@ -88,17 +101,20 @@ type batchResponse struct {
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
+	body := map[string]any{"version": Version, "commit": Commit, "stream": s.cfg.StreamKey}
 	if err := s.store.Ping(ctx); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "degraded", "redis": "down"})
+		body["status"], body["redis"] = "degraded", "down"
+		writeJSON(w, http.StatusServiceUnavailable, body)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "redis": "up", "stream": s.cfg.StreamKey})
+	body["status"], body["redis"] = "ok", "up"
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) ingestOne(w http.ResponseWriter, r *http.Request, userID string) {
 	var n notification
-	if err := decode(w, r, &n); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+	if code, err := decode(w, r, &n); err != nil {
+		fail(w, code, err.Error())
 		return
 	}
 	code, out := s.ingest(r.Context(), userID, n)
@@ -111,8 +127,8 @@ func (s *Server) ingestOne(w http.ResponseWriter, r *http.Request, userID string
 
 func (s *Server) ingestBatch(w http.ResponseWriter, r *http.Request, userID string) {
 	var b batchRequest
-	if err := decode(w, r, &b); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+	if code, err := decode(w, r, &b); err != nil {
+		fail(w, code, err.Error())
 		return
 	}
 	if len(b.Items) == 0 {
@@ -123,9 +139,13 @@ func (s *Server) ingestBatch(w http.ResponseWriter, r *http.Request, userID stri
 		fail(w, http.StatusBadRequest, fmt.Sprintf("at most %d items per batch", maxBatch))
 		return
 	}
+	// Once the batch is accepted it is processed to the end even if the phone
+	// disconnects: half a batch would leave the app unsure of what got in.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), batchTimeout)
+	defer cancel()
 	resp := batchResponse{Received: len(b.Items), Results: make([]outcome, 0, len(b.Items))}
 	for _, n := range b.Items {
-		code, out := s.ingest(r.Context(), userID, n)
+		code, out := s.ingest(ctx, userID, n)
 		switch {
 		case code == http.StatusAccepted:
 			resp.Queued++
@@ -145,7 +165,7 @@ func (s *Server) ingest(ctx context.Context, userID string, n notification) (int
 	if err != nil {
 		return http.StatusBadRequest, outcome{Error: err.Error()}
 	}
-	allowed, err := s.store.Allow(ctx, userID, s.cfg.RatePerMinute)
+	allowed, err := s.store.Allow(ctx, "user:"+userID+":"+s.minute(), s.cfg.RatePerMinute)
 	if err != nil {
 		return http.StatusServiceUnavailable, outcome{Error: "queue unavailable"}
 	}
@@ -186,6 +206,9 @@ func (s *Server) entry(userID string, n notification) (queue.Entry, error) {
 		if t.After(now.Add(24 * time.Hour)) {
 			return queue.Entry{}, errors.New("postedAt is in the future")
 		}
+		if t.Before(now.Add(-maxPostedAge)) {
+			return queue.Entry{}, errors.New("postedAt is older than 90 days")
+		}
 		posted = t.UTC()
 	}
 	source := strings.ToUpper(strings.TrimSpace(n.Source))
@@ -217,13 +240,28 @@ func (s *Server) dayOf(rfc3339 string) string {
 	return t.In(s.tz).Format("2006-01-02")
 }
 
+// minute names the current rate-limit window.
+func (s *Server) minute() string {
+	return s.Now().UTC().Format("200601021504")
+}
+
 // ── Middleware ────────────────────────────────────────
 
 type authedHandler func(w http.ResponseWriter, r *http.Request, userID string)
 
-// authenticated requires the shared API key and a valid access token from the API.
+// authenticated applies the per-IP brake, then requires the shared API key
+// and a valid token from the API (an access token or a capture token).
 func (s *Server) authenticated(next authedHandler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		allowed, err := s.store.Allow(r.Context(), "ip:"+clientIP(r)+":"+s.minute(), s.cfg.IPRatePerMinute)
+		if err != nil {
+			fail(w, http.StatusServiceUnavailable, "Queue unavailable")
+			return
+		}
+		if !allowed {
+			fail(w, http.StatusTooManyRequests, "Too many requests from this address")
+			return
+		}
 		if subtle.ConstantTimeCompare([]byte(r.Header.Get("x-api-key")), []byte(s.cfg.APIKey)) != 1 {
 			fail(w, http.StatusUnauthorized, "Invalid or missing API key")
 			return
@@ -252,6 +290,22 @@ func (s *Server) authenticated(next authedHandler) http.Handler {
 		}
 		next(w, r, claims.Subject)
 	})
+}
+
+// clientIP trusts the first X-Forwarded-For hop (Traefik sets it) and falls
+// back to the socket address.
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if first, _, ok := strings.Cut(xff, ","); ok {
+			return strings.TrimSpace(first)
+		}
+		return strings.TrimSpace(xff)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 type statusRecorder struct {
@@ -294,16 +348,22 @@ func (s *Server) recovered(next http.Handler) http.Handler {
 
 // ── Helpers ───────────────────────────────────────────
 
-func decode(w http.ResponseWriter, r *http.Request, v any) error {
+// decode reads a JSON body of at most maxBody bytes. It returns the status to
+// answer with: 415 for the wrong content type, 413 when too large, 400 otherwise.
+func decode(w http.ResponseWriter, r *http.Request, v any) (int, error) {
 	if ct := r.Header.Get("Content-Type"); ct != "" && !strings.HasPrefix(ct, "application/json") {
-		return errors.New("content-type must be application/json")
+		return http.StatusUnsupportedMediaType, errors.New("content-type must be application/json")
 	}
 	body := http.MaxBytesReader(w, r.Body, maxBody)
 	defer body.Close()
 	if err := json.NewDecoder(body).Decode(v); err != nil {
-		return errors.New("invalid JSON body")
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			return http.StatusRequestEntityTooLarge, fmt.Errorf("body is larger than %d bytes", maxBody)
+		}
+		return http.StatusBadRequest, errors.New("invalid JSON body")
 	}
-	return nil
+	return http.StatusOK, nil
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

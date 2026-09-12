@@ -4,6 +4,10 @@
 // a movement waiting for confirmation. The phone fires and forgets: even if
 // the API is restarting or the model is slow, the notification is already
 // safe in the queue.
+//
+//	ingest          run the service
+//	ingest -check   exit 0 when the running service answers /healthz with 200
+//	                (the container HEALTHCHECK; distroless has no curl)
 package main
 
 import (
@@ -28,6 +32,11 @@ func main() {
 		logger.Error("reading .env", "err", err)
 		os.Exit(1)
 	}
+
+	if len(os.Args) > 1 && (os.Args[1] == "-check" || os.Args[1] == "--check") {
+		os.Exit(healthCheck())
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		logger.Error("config", "err", err)
@@ -41,17 +50,27 @@ func main() {
 	}
 	defer store.Close()
 
+	// Redis may still be starting; say so instead of waiting for the first 503.
+	pingCtx, cancelPing := context.WithTimeout(context.Background(), 3*time.Second)
+	if err := store.Ping(pingCtx); err != nil {
+		logger.Warn("redis not reachable yet; /healthz will report degraded until it is", "err", err)
+	}
+	cancelPing()
+
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           server.New(cfg, store, logger).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
+		WriteTimeout:      20 * time.Second, // a full batch may take a while against a slow Redis
 		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {
-		logger.Info("ingest listening", "port", cfg.Port, "stream", cfg.StreamKey)
+		logger.Info("ingest listening",
+			"port", cfg.Port, "stream", cfg.StreamKey,
+			"version", server.Version, "commit", server.Commit,
+		)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("server", "err", err)
 			os.Exit(1)
@@ -66,4 +85,22 @@ func main() {
 	defer cancel()
 	_ = httpServer.Shutdown(shutdownCtx)
 	logger.Info("ingest stopped")
+}
+
+// healthCheck probes the local service the way the container runtime does.
+func healthCheck() int {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	res, err := client.Get("http://127.0.0.1:" + port + "/healthz")
+	if err != nil {
+		return 1
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return 1
+	}
+	return 0
 }
