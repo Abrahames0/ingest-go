@@ -75,8 +75,10 @@ completo aunque el teléfono corte la conexión a la mitad.
 `XADD capture:notifications MAXLEN ~ 50000 *` con campos (todos string):
 `userId`, `source`, `packageName`, `appName`, `title`, `text`, `postedAt`,
 `receivedAt`, `deviceId`. La API los lee con el grupo de consumidores `api`
-(`CAPTURE_STREAM_KEY` / `CAPTURE_CONSUMER_GROUP` en `api-fin/.env`) y confirma
-cada entrada al guardarla; las que fallan tres veces van a `capture:notifications:dead`.
+(`CAPTURE_STREAM_KEY` / `CAPTURE_CONSUMER_GROUP` en `api-fin/.env`), confirma y
+borra cada entrada al guardarla, así que el texto no se queda en Redis. Las que
+fallan tres veces se anotan en `capture:notifications:dead` sin `text` ni `title`,
+y cada noche la API recorta del stream lo que tenga más de 7 días.
 
 ## Configuración
 

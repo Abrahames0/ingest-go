@@ -1,0 +1,22 @@
+# Weekly update pull requests; CI (vet, tests, image build) runs on each.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: America/Mexico_City
+    groups:
+      go-modules:
+        patterns: ['*']
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: America/Mexico_City
+    groups:
+      actions:
+        patterns: ['*']
