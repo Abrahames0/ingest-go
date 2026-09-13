@@ -1,10 +1,11 @@
 // Package queue is the Redis side of the service: the rate limits, the early
-// duplicate filter, the revoked-token set and the stream the API consumes.
+// duplicate filter, the capture-token allow-list and the stream the API
+// consumes.
 package queue
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -49,13 +50,16 @@ type Store interface {
 	FirstSeen(ctx context.Context, key string, ttl time.Duration) (bool, error)
 	// Enqueue appends the entry to the stream and returns its id.
 	Enqueue(ctx context.Context, e Entry) (string, error)
-	// IsRevoked reports whether the API revoked the capture token with this id.
-	IsRevoked(ctx context.Context, jti string) (bool, error)
+	// IsActive reports whether the API lists the capture token with this id
+	// as active for this user. Revoking the token, expiring it or deactivating
+	// the account removes the entry, so a missing one means no.
+	IsActive(ctx context.Context, jti, sub string) (bool, error)
 	Close() error
 }
 
-// RevokedSet is the Redis set the API writes revoked capture token ids to.
-const RevokedSet = "capture:revoked"
+// ActiveKeyPrefix names the allow-list the API keeps: capture:active:{jti}
+// holds the user id and expires together with the token.
+const ActiveKeyPrefix = "capture:active:"
 
 // Rate-limit buckets are per minute; two minutes of life covers clock skew
 // between instances and lets the key disappear on its own.
@@ -82,7 +86,8 @@ type Redis struct {
 func NewRedis(url, stream string, maxLen int64) (*Redis, error) {
 	opt, err := redis.ParseURL(url)
 	if err != nil {
-		return nil, fmt.Errorf("REDIS_URL: %w", err)
+		// The parse error can quote the URL, password included.
+		return nil, errors.New("REDIS_URL is not a valid redis:// URL")
 	}
 	return &Redis{rdb: redis.NewClient(opt), stream: stream, maxLen: maxLen}, nil
 }
@@ -112,8 +117,15 @@ func (r *Redis) Enqueue(ctx context.Context, e Entry) (string, error) {
 	}).Result()
 }
 
-func (r *Redis) IsRevoked(ctx context.Context, jti string) (bool, error) {
-	return r.rdb.SIsMember(ctx, RevokedSet, jti).Result()
+func (r *Redis) IsActive(ctx context.Context, jti, sub string) (bool, error) {
+	owner, err := r.rdb.Get(ctx, ActiveKeyPrefix+jti).Result()
+	if errors.Is(err, redis.Nil) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return sub != "" && owner == sub, nil
 }
 
 func (r *Redis) Close() error {

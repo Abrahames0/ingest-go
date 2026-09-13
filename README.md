@@ -22,19 +22,31 @@ teléfono ──POST /ingest/notification──▶ ingest-go ──XADD──▶
 | `POST` | `/ingest/notification` | Una notificación. `202 {queued:true,id}` o `200 {queued:false,duplicate:true}` |
 | `POST` | `/ingest/notifications` | Hasta 50 en `{items:[...]}` (sincronización offline). `200 {received,queued,duplicates,rejected,results}` |
 
-Autenticación en los dos `POST`: header `x-api-key` (el `API_KEY` de la API) y
-`Authorization: Bearer <token>`, que puede ser el token de acceso que emite
-`POST /api/v1/auth/login` (15 min) o un token de captura de larga vida de
-`POST /api/v1/capture/tokens` (scope `capture`, un año). Los dos se verifican
-aquí con el mismo `JWT_ACCESS_SECRET`, sin llamar a la API. Los tokens de
-captura se pueden revocar: la API escribe el `jti` en el set de Redis
-`capture:revoked` y este servicio lo consulta en cada petición. Un token de
-acceso cerrado con `logout` sigue valiendo aquí hasta que expira (a lo más 15
-min): es por diseño, para no depender de la API en cada notificación.
+## Autenticación
+
+Los dos `POST` piden el header `x-api-key` (el `API_KEY` de la API) y
+`Authorization: Bearer <token de captura>`. Solo se aceptan tokens de captura,
+los de larga vida que emite `POST /api/v1/capture/tokens` para el atajo de iOS
+y el listener de Android: JWT HS256 firmados con `CAPTURE_TOKEN_SECRET`, un
+secreto propio que no firma nada más. Este servicio exige `iss: centli`,
+`aud: centli-capture`, `scope: capture`, `sub` (el usuario), `jti` (el id del
+token) y un `exp` vigente, y rechaza cualquier otro algoritmo. Un token de
+acceso de la API (`aud: centli-api`, firmado con otro secreto) recibe `401`.
+
+La firma no basta. La API lleva una lista de tokens activos en Redis:
+`capture:active:{jti}` guarda el id del usuario y caduca junto con el token.
+Revocar un token, revocarlos todos o desactivar la cuenta borra la entrada, y en
+cada petición este servicio exige que exista y coincida con `sub`. Sin la
+entrada, aunque Redis haya perdido sus datos, la respuesta es `401`: el servicio
+falla cerrado.
 
 Antes de autenticar hay un freno por dirección IP (`IP_RATE_PER_MINUTE`, 600 por
-defecto, primer salto de `X-Forwarded-For` detrás de Traefik) contra la fuerza
-bruta sobre la API key.
+defecto) contra la fuerza bruta sobre la API key. La dirección sale de
+`X-Forwarded-For` según `TRUST_PROXY_HOPS`, el número de proxies delante del
+servicio: con N se toma la entrada N lugares desde la derecha, contando la
+dirección del socket como la última, igual que `trust proxy` de Express en la
+API. Las entradas más a la izquierda las escribe el cliente y se ignoran. `0` en
+local, `1` detrás de Traefik y `2` si además pasa por el proxy de Cloudflare.
 
 Cuerpo de una notificación (mismo contrato que `POST /api/v1/capture/notifications`):
 
@@ -73,8 +85,9 @@ Variables de entorno (o un `.env` junto al binario; ver `.env.example`):
 | Variable | Default | Nota |
 |---|---|---|
 | `API_KEY` | — | Igual que en `api-fin` |
-| `JWT_ACCESS_SECRET` | — | Igual que en `api-fin` |
-| `REDIS_URL` | `redis://localhost:6379` | El mismo Redis que usa la API |
+| `CAPTURE_TOKEN_SECRET` | — | Igual que en `api-fin`; 32+ caracteres y distinto de `API_KEY` |
+| `REDIS_URL` | `redis://localhost:6379` | El Redis de la API; en producción, con el usuario ACL de abajo |
+| `TRUST_PROXY_HOPS` | `0` | Proxies delante del servicio, de 0 a 5 |
 | `PORT` | `8080` | |
 | `CAPTURE_STREAM_KEY` | `capture:notifications` | Igual que en `api-fin` |
 | `CAPTURE_STREAM_MAXLEN` | `50000` | Tope aproximado del stream |
@@ -82,10 +95,33 @@ Variables de entorno (o un `.env` junto al binario; ver `.env.example`):
 | `RATE_PER_MINUTE` | `120` | Por usuario, después de autenticar |
 | `IP_RATE_PER_MINUTE` | `600` | Por dirección IP, antes de autenticar |
 
+## Usuario ACL de Redis para producción
+
+Con la contraseña de Redis de la API, este servicio podría leer los tokens de
+actualización (`rt:*`) y los enlaces para cambiar la contraseña (`pr:*`). En
+producción dale un usuario propio (Redis 7 o posterior), limitado a sus llaves,
+a lo que hace con cada una y a los comandos que ejecuta:
+
+```
+ACL SETUSER ingest on >CONTRASEÑA_LARGA resetkeys %RW~ingest:* %R~capture:active:* %W~capture:notifications resetchannels -@all +ping +get +set +incr +expire +eval +evalsha +xadd +client|setinfo
+```
+
+- `%RW~ingest:*`: los contadores de los frenos (`INCR` y `EXPIRE` dentro de un script con `EVALSHA`, o `EVAL` la primera vez) y el filtro de repetidas (`SET NX`).
+- `%R~capture:active:*`: la lista de tokens de captura activos, solo lectura. Aunque alguien tomara el servicio, no podría dar de alta tokens.
+- `%W~capture:notifications`: el stream, solo escritura con `XADD` y `MAXLEN ~`; no puede leer las notificaciones de nadie. El patrón es exacto: la cola muerta `capture:notifications:dead` es de la API.
+- `PING` responde `/healthz`. `AUTH` y `HELLO` no necesitan permiso; `client|setinfo` es el saludo con que go-redis anuncia su versión (sin él todo funciona, pero cada conexión deja dos rechazos en `ACL LOG`).
+
+Luego `REDIS_URL=redis://ingest:CONTRASEÑA_LARGA@<host>:6379/0`. Con una base
+distinta de la `0`, go-redis manda `SELECT` y hay que agregar `+select`. Si
+cambias `CAPTURE_STREAM_KEY`, cambia también ese patrón. `ACL SETUSER` no
+sobrevive un reinicio si Redis no usa `aclfile`: pon la regla en el archivo ACL o
+como `user ingest on ...` en la configuración. Para revisar un permiso sin
+ejecutarlo: `ACL DRYRUN ingest XADD capture:notifications MAXLEN ~ 50000 * userId x`.
+
 ## Correr
 
 ```bash
-cp .env.example .env   # y pega API_KEY, JWT_ACCESS_SECRET y REDIS_URL de api-fin/.env
+cp .env.example .env   # y pega API_KEY, CAPTURE_TOKEN_SECRET y REDIS_URL de api-fin/.env
 go run .
 go test ./...
 go vet ./...
@@ -107,15 +143,18 @@ commit con que se construyó.
 
 ## Probar a mano
 
-Sin levantar la API, `go run ./cmd/token <userId> [ttl]` firma un token con el
-mismo secreto (la API sí exige que el usuario exista; este servicio no). En
-Windows, `curl` re-codifica los argumentos a cp1252: manda el cuerpo con
-`--data-binary @archivo.json` para que los acentos lleguen intactos.
+Con la API corriendo, pide un token de captura con un token de acceso y úsalo
+aquí. En Windows, `curl` re-codifica los argumentos a cp1252: manda el cuerpo
+con `--data-binary @archivo.json` para que los acentos lleguen intactos.
 
 ```bash
-TOKEN=$(curl -s -X POST http://localhost:3000/api/v1/auth/login \
+ACCESS=$(curl -s -X POST http://localhost:3000/api/v1/auth/login \
   -H "x-api-key: $API_KEY" -H "content-type: application/json" \
   -d '{"email":"tu@correo.mx","password":"..."}' | jq -r .data.accessToken)
+
+TOKEN=$(curl -s -X POST http://localhost:3000/api/v1/capture/tokens \
+  -H "x-api-key: $API_KEY" -H "Authorization: Bearer $ACCESS" \
+  -H "content-type: application/json" -d '{"name":"curl"}' | jq -r .data.token)
 
 curl -i -X POST http://localhost:8080/ingest/notification \
   -H "x-api-key: $API_KEY" -H "Authorization: Bearer $TOKEN" \
@@ -124,3 +163,7 @@ curl -i -X POST http://localhost:8080/ingest/notification \
 ```
 
 Segundos después la captura aparece en `GET /api/v1/capture` de la API.
+
+Sin la API, `go run ./cmd/token -sub <userId> -activate` firma un token con el
+mismo secreto y lo da de alta en la lista de activos de `REDIS_URL`. Es solo para
+desarrollo: la API exige que el usuario exista y esta herramienta no.

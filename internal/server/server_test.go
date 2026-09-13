@@ -20,16 +20,17 @@ import (
 // ── Fake store ────────────────────────────────────────
 
 type fakeStore struct {
-	entries []queue.Entry
-	seen    map[string]bool
-	count   map[string]int
-	revoked map[string]bool
-	pingErr error
-	downErr error
+	entries   []queue.Entry
+	seen      map[string]bool
+	count     map[string]int
+	active    map[string]string // capture token id → user id, like capture:active:{jti}
+	pingErr   error
+	downErr   error // every Redis call fails
+	activeErr error // only the allow-list lookup fails
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{seen: map[string]bool{}, count: map[string]int{}, revoked: map[string]bool{}}
+	return &fakeStore{seen: map[string]bool{}, count: map[string]int{}, active: map[string]string{}}
 }
 
 func (f *fakeStore) Ping(context.Context) error { return f.pingErr }
@@ -55,11 +56,14 @@ func (f *fakeStore) Enqueue(_ context.Context, e queue.Entry) (string, error) {
 	return fmt.Sprintf("%d-0", len(f.entries)), nil
 }
 
-func (f *fakeStore) IsRevoked(_ context.Context, jti string) (bool, error) {
+func (f *fakeStore) IsActive(_ context.Context, jti, sub string) (bool, error) {
 	if f.downErr != nil {
 		return false, f.downErr
 	}
-	return f.revoked[jti], nil
+	if f.activeErr != nil {
+		return false, f.activeErr
+	}
+	return sub != "" && f.active[jti] == sub, nil
 }
 
 func (f *fakeStore) Close() error { return nil }
@@ -72,14 +76,14 @@ var frozen = time.Date(2026, 9, 10, 15, 0, 0, 0, time.UTC)
 
 func newTestServer() (*Server, *fakeStore) {
 	cfg := config.Config{
-		Port:            "0",
-		APIKey:          "api-key",
-		JWTSecret:       secret,
-		StreamKey:       "capture:test",
-		MaxTextLength:   2000,
-		RatePerMinute:   3,
-		IPRatePerMinute: 100,
-		DedupeTTL:       time.Hour,
+		Port:               "0",
+		APIKey:             "api-key",
+		CaptureTokenSecret: secret,
+		StreamKey:          "capture:test",
+		MaxTextLength:      2000,
+		RatePerMinute:      3,
+		IPRatePerMinute:    100,
+		DedupeTTL:          time.Hour,
 	}
 	store := newFakeStore()
 	srv := New(cfg, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -87,12 +91,23 @@ func newTestServer() (*Server, *fakeStore) {
 	return srv, store
 }
 
-func token(sub string, exp time.Time) string {
-	return auth.Sign(auth.Claims{Subject: sub, ExpiresAt: exp.Unix()}, []byte(secret))
+// captureToken signs a token like the ones POST /api/v1/capture/tokens returns.
+func captureToken(sub, jti string, exp time.Time) string {
+	claims := auth.CaptureClaims(sub, jti, frozen.Add(-time.Hour), time.Hour)
+	claims.ExpiresAt = exp.Unix()
+	return auth.Sign(claims, []byte(secret))
 }
 
-func captureToken(sub, jti string, exp time.Time) string {
-	return auth.Sign(auth.Claims{Subject: sub, Scope: "capture", ID: jti, ExpiresAt: exp.Unix()}, []byte(secret))
+func bearer(token string) map[string]string {
+	return map[string]string{"x-api-key": "api-key", "Authorization": "Bearer " + token}
+}
+
+// authed returns the headers of a request with a capture token that the store
+// lists as active for sub.
+func authed(store *fakeStore, sub string) map[string]string {
+	jti := "tok-" + sub
+	store.active[jti] = sub
+	return bearer(captureToken(sub, jti, frozen.Add(365*24*time.Hour)))
 }
 
 func do(srv *Server, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
@@ -104,13 +119,6 @@ func do(srv *Server, method, path, body string, headers map[string]string) *http
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 	return rec
-}
-
-func authed(sub string) map[string]string {
-	return map[string]string{
-		"x-api-key":     "api-key",
-		"Authorization": "Bearer " + token(sub, frozen.Add(time.Hour)),
-	}
 }
 
 func decodeBody[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
@@ -136,8 +144,9 @@ func TestHealth(t *testing.T) {
 }
 
 func TestAuth(t *testing.T) {
-	srv, _ := newTestServer()
+	srv, store := newTestServer()
 	body := `{"text":"Compra por $350"}`
+	live := authed(store, "u1")
 
 	if rec := do(srv, "POST", "/ingest/notification", body, nil); rec.Code != 401 {
 		t.Fatalf("no api key: %d", rec.Code)
@@ -145,46 +154,81 @@ func TestAuth(t *testing.T) {
 	if rec := do(srv, "POST", "/ingest/notification", body, map[string]string{"x-api-key": "api-key"}); rec.Code != 401 {
 		t.Fatalf("no token: %d", rec.Code)
 	}
-	bad := map[string]string{"x-api-key": "api-key", "Authorization": "Bearer nope"}
-	if rec := do(srv, "POST", "/ingest/notification", body, bad); rec.Code != 401 {
+	if rec := do(srv, "POST", "/ingest/notification", body, bearer("nope")); rec.Code != 401 {
 		t.Fatalf("bad token: %d", rec.Code)
 	}
-	expired := map[string]string{"x-api-key": "api-key", "Authorization": "Bearer " + token("u1", frozen.Add(-time.Second))}
-	if rec := do(srv, "POST", "/ingest/notification", body, expired); rec.Code != 401 {
+	if rec := do(srv, "POST", "/ingest/notification", body, bearer(captureToken("u1", "tok-u1", frozen.Add(-time.Second)))); rec.Code != 401 {
 		t.Fatalf("expired token: %d", rec.Code)
 	}
-	wrongKey := map[string]string{"x-api-key": "other", "Authorization": "Bearer " + token("u1", frozen.Add(time.Hour))}
+	wrongKey := map[string]string{"x-api-key": "other", "Authorization": live["Authorization"]}
 	if rec := do(srv, "POST", "/ingest/notification", body, wrongKey); rec.Code != 401 {
 		t.Fatalf("wrong api key: %d", rec.Code)
+	}
+	if rec := do(srv, "POST", "/ingest/notification", body, live); rec.Code != 202 {
+		t.Fatalf("live capture token: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRejectsAPIAccessTokens(t *testing.T) {
+	srv, store := newTestServer()
+	store.active["jti-1"] = "u1" // even if its id happened to be listed
+	access := auth.Claims{
+		Subject:   "u1",
+		ID:        "jti-1",
+		Issuer:    auth.Issuer,
+		Audience:  auth.Audience{"centli-api"},
+		IssuedAt:  frozen.Unix(),
+		ExpiresAt: frozen.Add(15 * time.Minute).Unix(),
+	}
+	for name, key := range map[string]string{
+		"signed with the access secret":  "the-api-access-token-secret-is-other",
+		"signed with the capture secret": secret,
+	} {
+		rec := do(srv, "POST", "/ingest/notification", `{"text":"Compra por $350"}`, bearer(auth.Sign(access, []byte(key))))
+		if rec.Code != 401 {
+			t.Errorf("%s: want 401, got %d", name, rec.Code)
+		}
+	}
+	if len(store.entries) != 0 {
+		t.Fatalf("nothing may be queued: %+v", store.entries)
 	}
 }
 
 func TestCaptureTokens(t *testing.T) {
 	srv, store := newTestServer()
 	body := `{"text":"Compra por $350 en OXXO","title":"BBVA"}`
-	headers := map[string]string{"x-api-key": "api-key", "Authorization": "Bearer " + captureToken("u1", "tok-1", frozen.Add(365*24*time.Hour))}
+	headers := bearer(captureToken("u1", "tok-1", frozen.Add(365*24*time.Hour)))
 
+	// Signed correctly but not listed: revoked, never issued or Redis was wiped.
+	if rec := do(srv, "POST", "/ingest/notification", body, headers); rec.Code != 401 {
+		t.Fatalf("unlisted capture token: %d", rec.Code)
+	}
+	store.active["tok-1"] = "u2"
+	if rec := do(srv, "POST", "/ingest/notification", body, headers); rec.Code != 401 {
+		t.Fatalf("token id listed for another user: %d", rec.Code)
+	}
+	store.active["tok-1"] = "u1"
 	if rec := do(srv, "POST", "/ingest/notification", body, headers); rec.Code != 202 {
-		t.Fatalf("capture token accepted: %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("listed capture token: %d %s", rec.Code, rec.Body.String())
 	}
 	if len(store.entries) != 1 || store.entries[0].UserID != "u1" {
 		t.Fatalf("entry not queued for the token's user: %+v", store.entries)
 	}
-	store.revoked["tok-1"] = true
+	delete(store.active, "tok-1")
 	if rec := do(srv, "POST", "/ingest/notification", body, headers); rec.Code != 401 {
 		t.Fatalf("revoked capture token: %d", rec.Code)
 	}
-	store.revoked["tok-1"] = false
-	store.downErr = fmt.Errorf("redis down")
+	store.active["tok-1"] = "u1"
+	store.activeErr = fmt.Errorf("redis down")
 	if rec := do(srv, "POST", "/ingest/notification", body, headers); rec.Code != 503 {
-		t.Fatalf("revocation check without redis: %d", rec.Code)
+		t.Fatalf("allow-list check without redis: %d", rec.Code)
 	}
 }
 
 func TestIngestQueuesNormalizedEntry(t *testing.T) {
 	srv, store := newTestServer()
 	body := `{"text":"  Compra   por $350 en  OXXO ","title":" BBVA ","packageName":"com.bancomer.mbanking","postedAt":"2026-09-10T14:32:00-06:00","deviceId":"pixel"}`
-	rec := do(srv, "POST", "/ingest/notification", body, authed("user-1"))
+	rec := do(srv, "POST", "/ingest/notification", body, authed(store, "user-1"))
 	if rec.Code != 202 {
 		t.Fatalf("want 202, got %d %s", rec.Code, rec.Body.String())
 	}
@@ -214,10 +258,10 @@ func TestIngestQueuesNormalizedEntry(t *testing.T) {
 func TestIngestDuplicateIsNotQueuedTwice(t *testing.T) {
 	srv, store := newTestServer()
 	body := `{"text":"Compra por $350 en OXXO","postedAt":"2026-09-10T14:32:00-06:00"}`
-	if rec := do(srv, "POST", "/ingest/notification", body, authed("user-1")); rec.Code != 202 {
+	if rec := do(srv, "POST", "/ingest/notification", body, authed(store, "user-1")); rec.Code != 202 {
 		t.Fatalf("first: %d", rec.Code)
 	}
-	rec := do(srv, "POST", "/ingest/notification", body, authed("user-1"))
+	rec := do(srv, "POST", "/ingest/notification", body, authed(store, "user-1"))
 	if rec.Code != 200 {
 		t.Fatalf("second: want 200, got %d", rec.Code)
 	}
@@ -228,13 +272,13 @@ func TestIngestDuplicateIsNotQueuedTwice(t *testing.T) {
 		t.Fatalf("entries = %d", len(store.entries))
 	}
 	// Same text for another user is not a duplicate.
-	if rec := do(srv, "POST", "/ingest/notification", body, authed("user-2")); rec.Code != 202 {
+	if rec := do(srv, "POST", "/ingest/notification", body, authed(store, "user-2")); rec.Code != 202 {
 		t.Fatalf("other user: %d", rec.Code)
 	}
 }
 
 func TestIngestValidation(t *testing.T) {
-	srv, _ := newTestServer()
+	srv, store := newTestServer()
 	cases := map[string]string{
 		"empty text":   `{"text":"   "}`,
 		"bad date":     `{"text":"Compra por $350","postedAt":"ayer"}`,
@@ -244,32 +288,33 @@ func TestIngestValidation(t *testing.T) {
 		"invalid json": `{"text":`,
 	}
 	for name, body := range cases {
-		if rec := do(srv, "POST", "/ingest/notification", body, authed("user-1")); rec.Code != 400 {
+		if rec := do(srv, "POST", "/ingest/notification", body, authed(store, "user-1")); rec.Code != 400 {
 			t.Errorf("%s: want 400, got %d %s", name, rec.Code, rec.Body.String())
 		}
 	}
 }
 
 func TestRateLimit(t *testing.T) {
-	srv, _ := newTestServer() // limit 3 per minute
+	srv, store := newTestServer() // limit 3 per minute
 	for i := 0; i < 3; i++ {
 		body := fmt.Sprintf(`{"text":"Compra por $%d"}`, i)
-		if rec := do(srv, "POST", "/ingest/notification", body, authed("user-1")); rec.Code != 202 {
+		if rec := do(srv, "POST", "/ingest/notification", body, authed(store, "user-1")); rec.Code != 202 {
 			t.Fatalf("request %d: %d", i, rec.Code)
 		}
 	}
-	if rec := do(srv, "POST", "/ingest/notification", `{"text":"Compra por $9"}`, authed("user-1")); rec.Code != 429 {
+	if rec := do(srv, "POST", "/ingest/notification", `{"text":"Compra por $9"}`, authed(store, "user-1")); rec.Code != 429 {
 		t.Fatalf("want 429, got %d", rec.Code)
 	}
-	if rec := do(srv, "POST", "/ingest/notification", `{"text":"Compra por $9"}`, authed("user-2")); rec.Code != 202 {
+	if rec := do(srv, "POST", "/ingest/notification", `{"text":"Compra por $9"}`, authed(store, "user-2")); rec.Code != 202 {
 		t.Fatalf("other user should pass: %d", rec.Code)
 	}
 }
 
 func TestQueueDown(t *testing.T) {
 	srv, store := newTestServer()
+	headers := authed(store, "user-1")
 	store.downErr = fmt.Errorf("redis down")
-	if rec := do(srv, "POST", "/ingest/notification", `{"text":"Compra por $1"}`, authed("user-1")); rec.Code != 503 {
+	if rec := do(srv, "POST", "/ingest/notification", `{"text":"Compra por $1"}`, headers); rec.Code != 503 {
 		t.Fatalf("want 503, got %d", rec.Code)
 	}
 }
@@ -277,7 +322,7 @@ func TestQueueDown(t *testing.T) {
 func TestBatch(t *testing.T) {
 	srv, store := newTestServer()
 	body := `{"items":[{"text":"Compra por $1"},{"text":"Compra por $2"},{"text":"   "},{"text":"Compra por $1"}]}`
-	rec := do(srv, "POST", "/ingest/notifications", body, authed("user-1"))
+	rec := do(srv, "POST", "/ingest/notifications", body, authed(store, "user-1"))
 	if rec.Code != 200 {
 		t.Fatalf("want 200, got %d %s", rec.Code, rec.Body.String())
 	}
@@ -291,15 +336,15 @@ func TestBatch(t *testing.T) {
 	if len(store.entries) != 2 {
 		t.Fatalf("entries = %d", len(store.entries))
 	}
-	if rec := do(srv, "POST", "/ingest/notifications", `{"items":[]}`, authed("user-1")); rec.Code != 400 {
+	if rec := do(srv, "POST", "/ingest/notifications", `{"items":[]}`, authed(store, "user-1")); rec.Code != 400 {
 		t.Fatalf("empty batch: %d", rec.Code)
 	}
 }
 
 func TestPayloadTooLarge(t *testing.T) {
-	srv, _ := newTestServer()
+	srv, store := newTestServer()
 	body := fmt.Sprintf(`{"text":"%s"}`, strings.Repeat("a", maxBody+1))
-	if rec := do(srv, "POST", "/ingest/notification", body, authed("user-1")); rec.Code != http.StatusRequestEntityTooLarge {
+	if rec := do(srv, "POST", "/ingest/notification", body, authed(store, "user-1")); rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("want 413, got %d %s", rec.Code, rec.Body.String())
 	}
 }
@@ -307,11 +352,11 @@ func TestPayloadTooLarge(t *testing.T) {
 func TestPostedAtTooOld(t *testing.T) {
 	srv, store := newTestServer()
 	old := frozen.Add(-91 * 24 * time.Hour).Format(time.RFC3339)
-	if rec := do(srv, "POST", "/ingest/notification", `{"text":"Compra por $1","postedAt":"`+old+`"}`, authed("user-1")); rec.Code != 400 {
+	if rec := do(srv, "POST", "/ingest/notification", `{"text":"Compra por $1","postedAt":"`+old+`"}`, authed(store, "user-1")); rec.Code != 400 {
 		t.Fatalf("91 days old: want 400, got %d", rec.Code)
 	}
 	recent := frozen.Add(-30 * 24 * time.Hour).Format(time.RFC3339)
-	if rec := do(srv, "POST", "/ingest/notification", `{"text":"Compra por $1","postedAt":"`+recent+`"}`, authed("user-1")); rec.Code != 202 {
+	if rec := do(srv, "POST", "/ingest/notification", `{"text":"Compra por $1","postedAt":"`+recent+`"}`, authed(store, "user-1")); rec.Code != 202 {
 		t.Fatalf("30 days old: want 202, got %d %s", rec.Code, rec.Body.String())
 	}
 	if len(store.entries) != 1 {
@@ -322,18 +367,49 @@ func TestPostedAtTooOld(t *testing.T) {
 func TestIPRateLimitRunsBeforeAuth(t *testing.T) {
 	srv, _ := newTestServer()
 	srv.cfg.IPRatePerMinute = 2
-	bad := map[string]string{"x-api-key": "wrong", "X-Forwarded-For": "203.0.113.9, 10.0.0.1"}
+	srv.cfg.TrustProxyHops = 1 // behind Traefik
+	attempt := func(xff string) int {
+		headers := map[string]string{"x-api-key": "wrong", "X-Forwarded-For": xff}
+		return do(srv, "POST", "/ingest/notification", `{"text":"x"}`, headers).Code
+	}
 	for i := 0; i < 2; i++ {
-		if rec := do(srv, "POST", "/ingest/notification", `{"text":"x"}`, bad); rec.Code != 401 {
-			t.Fatalf("attempt %d: want 401, got %d", i, rec.Code)
+		if code := attempt("6.6.6.6, 203.0.113.9"); code != 401 {
+			t.Fatalf("attempt %d: want 401, got %d", i, code)
 		}
 	}
-	if rec := do(srv, "POST", "/ingest/notification", `{"text":"x"}`, bad); rec.Code != 429 {
-		t.Fatalf("third attempt from the same address: want 429, got %d", rec.Code)
+	// Rewriting the left entry, which the client controls, does not dodge the brake.
+	if code := attempt("7.7.7.7, 203.0.113.9"); code != 429 {
+		t.Fatalf("third attempt from the same address: want 429, got %d", code)
 	}
-	other := map[string]string{"x-api-key": "wrong", "X-Forwarded-For": "198.51.100.4"}
-	if rec := do(srv, "POST", "/ingest/notification", `{"text":"x"}`, other); rec.Code != 401 {
-		t.Fatalf("another address is not affected: %d", rec.Code)
+	if code := attempt("6.6.6.6, 198.51.100.4"); code != 401 {
+		t.Fatalf("another address is not affected: %d", code)
+	}
+}
+
+func TestClientIPTrustsOnlyTheConfiguredHops(t *testing.T) {
+	cases := []struct {
+		name   string
+		hops   int
+		xff    []string
+		remote string
+		want   string
+	}{
+		{"no proxy ignores the header", 0, []string{"6.6.6.6"}, "198.51.100.20:5000", "198.51.100.20"},
+		{"behind Traefik", 1, []string{"6.6.6.6, 203.0.113.9"}, "10.0.1.5:40000", "203.0.113.9"},
+		{"Cloudflare then Traefik", 2, []string{"6.6.6.6, 203.0.113.9, 172.70.4.2"}, "10.0.1.5:40000", "203.0.113.9"},
+		{"several header lines", 1, []string{"6.6.6.6", "203.0.113.9"}, "10.0.1.5:40000", "203.0.113.9"},
+		{"more hops than entries", 3, []string{"203.0.113.9"}, "10.0.1.5:40000", "203.0.113.9"},
+		{"proxy expected but no header", 1, nil, "198.51.100.20:5000", "198.51.100.20"},
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest("POST", "/ingest/notification", nil)
+		req.RemoteAddr = c.remote
+		for _, v := range c.xff {
+			req.Header.Add("X-Forwarded-For", v)
+		}
+		if got := clientIP(req, c.hops); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
 	}
 }
 
@@ -349,10 +425,10 @@ func TestHealthReportsVersion(t *testing.T) {
 }
 
 func TestRejectsNonJSON(t *testing.T) {
-	srv, _ := newTestServer()
+	srv, store := newTestServer()
 	req := httptest.NewRequest("POST", "/ingest/notification", strings.NewReader("text=hola"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	for k, v := range authed("user-1") {
+	for k, v := range authed(store, "user-1") {
 		req.Header.Set(k, v)
 	}
 	rec := httptest.NewRecorder()

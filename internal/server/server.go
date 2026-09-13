@@ -1,5 +1,5 @@
-// Package server is the HTTP layer: API key + JWT, validation, rate limits,
-// duplicate filter, enqueue.
+// Package server is the HTTP layer: API key + capture token, validation,
+// rate limits, duplicate filter, enqueue.
 package server
 
 import (
@@ -250,10 +250,10 @@ func (s *Server) minute() string {
 type authedHandler func(w http.ResponseWriter, r *http.Request, userID string)
 
 // authenticated applies the per-IP brake, then requires the shared API key
-// and a valid token from the API (an access token or a capture token).
+// and a capture token that the API still lists as active.
 func (s *Server) authenticated(next authedHandler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		allowed, err := s.store.Allow(r.Context(), "ip:"+clientIP(r)+":"+s.minute(), s.cfg.IPRatePerMinute)
+		allowed, err := s.store.Allow(r.Context(), "ip:"+clientIP(r, s.cfg.TrustProxyHops)+":"+s.minute(), s.cfg.IPRatePerMinute)
 		if err != nil {
 			fail(w, http.StatusServiceUnavailable, "Queue unavailable")
 			return
@@ -271,41 +271,49 @@ func (s *Server) authenticated(next authedHandler) http.Handler {
 			fail(w, http.StatusUnauthorized, "Missing bearer token")
 			return
 		}
-		claims, err := auth.Verify(strings.TrimPrefix(header, "Bearer "), []byte(s.cfg.JWTSecret), s.Now())
+		// Only capture tokens pass: an API access token is signed with another
+		// secret and carries another audience.
+		claims, err := auth.Verify(strings.TrimPrefix(header, "Bearer "), []byte(s.cfg.CaptureTokenSecret), s.Now())
 		if err != nil {
-			fail(w, http.StatusUnauthorized, "Invalid or expired token")
+			fail(w, http.StatusUnauthorized, "Invalid or expired capture token")
 			return
 		}
-		// A capture token stays valid for a year; revocation lives in Redis.
-		if claims.Scope == "capture" && claims.ID != "" {
-			revoked, err := s.store.IsRevoked(r.Context(), claims.ID)
-			if err != nil {
-				fail(w, http.StatusServiceUnavailable, "Queue unavailable")
-				return
-			}
-			if revoked {
-				fail(w, http.StatusUnauthorized, "Capture token revoked")
-				return
-			}
+		// The signature lasts a year; whether the token still counts lives in
+		// Redis. Revoking, expiring or deactivating the account removes the
+		// entry, and a missing entry is a no even if Redis lost its data.
+		active, err := s.store.IsActive(r.Context(), claims.ID, claims.Subject)
+		if err != nil {
+			fail(w, http.StatusServiceUnavailable, "Queue unavailable")
+			return
+		}
+		if !active {
+			fail(w, http.StatusUnauthorized, "Capture token is no longer active")
+			return
 		}
 		next(w, r, claims.Subject)
 	})
 }
 
-// clientIP trusts the first X-Forwarded-For hop (Traefik sets it) and falls
-// back to the socket address.
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if first, _, ok := strings.Cut(xff, ","); ok {
-			return strings.TrimSpace(first)
+// clientIP is the address the per-IP brake counts. Every proxy appends the
+// address it got the request from to X-Forwarded-For, so with hops proxies in
+// front the client is the entry hops places from the right, counting the
+// socket address as the last one: the rule of Express `trust proxy` in the
+// API. Entries further left were written by the client and are ignored.
+func clientIP(r *http.Request, hops int) string {
+	var chain []string
+	for _, line := range r.Header.Values("X-Forwarded-For") {
+		for part := range strings.SplitSeq(line, ",") {
+			if addr := strings.TrimSpace(part); addr != "" {
+				chain = append(chain, addr)
+			}
 		}
-		return strings.TrimSpace(xff)
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
 	}
-	return host
+	chain = append(chain, host)
+	return chain[max(len(chain)-1-hops, 0)]
 }
 
 type statusRecorder struct {

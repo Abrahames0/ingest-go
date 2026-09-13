@@ -3,10 +3,9 @@ package queue
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // These run against a real Redis when REDIS_URL is set (CI starts one);
@@ -74,17 +73,31 @@ func TestFirstSeenAndEnqueue(t *testing.T) {
 	}
 }
 
-func TestIsRevoked(t *testing.T) {
+func TestIsActive(t *testing.T) {
 	r, ctx := testRedis(t)
 	jti := "test-" + t.Name() + "-" + time.Now().Format("150405.000")
-	if revoked, err := r.IsRevoked(ctx, jti); err != nil || revoked {
-		t.Fatalf("unknown id: revoked=%v err=%v", revoked, err)
+	key := ActiveKeyPrefix + jti
+	if active, err := r.IsActive(ctx, jti, "u1"); err != nil || active {
+		t.Fatalf("unlisted id: active=%v err=%v", active, err)
 	}
-	r.rdb.SAdd(ctx, RevokedSet, jti)
-	t.Cleanup(func() { r.rdb.SRem(ctx, RevokedSet, jti) })
-	if revoked, _ := r.IsRevoked(ctx, jti); !revoked {
-		t.Fatal("id in the set must count as revoked")
+	if err := r.rdb.Set(ctx, key, "u1", time.Minute).Err(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.rdb.Del(context.Background(), key) })
+	if active, err := r.IsActive(ctx, jti, "u1"); err != nil || !active {
+		t.Fatalf("listed id: active=%v err=%v", active, err)
+	}
+	if active, _ := r.IsActive(ctx, jti, "u2"); active {
+		t.Fatal("an id listed for another user must not count as active")
 	}
 }
 
-var _ = redis.Nil // keep the import used if the tests above change
+func TestNewRedisDoesNotEchoTheURL(t *testing.T) {
+	_, err := NewRedis("redis://user:hunter2-password@[::1", "s", 1)
+	if err == nil {
+		t.Fatal("a malformed URL must be rejected")
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Fatalf("the error must not quote the URL: %q", err)
+	}
+}
