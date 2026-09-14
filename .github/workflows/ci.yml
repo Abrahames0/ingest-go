@@ -18,8 +18,10 @@ jobs:
           --health-cmd "redis-cli ping"
           --health-interval 5s --health-timeout 5s --health-retries 10
     env:
-      # Lets the queue package tests run against a real Redis.
+      # Lets the queue package tests run against a real Redis, and fails
+      # them instead of skipping when it is not there.
       REDIS_URL: redis://localhost:6379
+      REDIS_REQUIRED: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

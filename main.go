@@ -6,8 +6,10 @@
 // safe in the queue.
 //
 //	ingest          run the service
-//	ingest -check   exit 0 when the running service answers /healthz with 200
-//	                (the container HEALTHCHECK; distroless has no curl)
+//	ingest -check   exit 0 when the running service answers /healthz
+//	                (the container HEALTHCHECK; distroless has no curl).
+//	                200 and 503 both count: the process is serving, and a
+//	                Redis outage must not get it restarted in a loop
 package main
 
 import (
@@ -99,7 +101,7 @@ func healthCheck() int {
 		return 1
 	}
 	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusServiceUnavailable {
 		return 1
 	}
 	return 0

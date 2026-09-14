@@ -18,9 +18,9 @@ teléfono ──POST /ingest/notification──▶ ingest-go ──XADD──▶
 
 | Método | Ruta | Descripción |
 |---|---|---|
-| `GET` | `/healthz` | `200 {status:"ok", version, commit}` si Redis responde, `503 {status:"degraded"}` si no |
+| `GET` | `/healthz` | `200 {status:"ok", version, commit}` si Redis responde, `503 {status:"degraded"}` si no. El `HEALTHCHECK` del contenedor (`ingest -check`) acepta ambos: un Redis caído no reinicia el servicio en bucle |
 | `POST` | `/ingest/notification` | Una notificación. `202 {queued:true,id}` o `200 {queued:false,duplicate:true}` |
-| `POST` | `/ingest/notifications` | Hasta 50 en `{items:[...]}` (sincronización offline). `200 {received,queued,duplicates,rejected,results}` |
+| `POST` | `/ingest/notifications` | Hasta 50 en `{items:[...]}` (sincronización offline). `200 {received,queued,duplicates,rejected,retry,results}`; cada `results[i]` trae `status` (202 encolada, 200 repetida, 400 inválida, 429 fuera de límite, 503 cola caída). `rejected` se descarta, `retry` se reenvía; si la cola falló con algún elemento la respuesta completa es `503` para que el teléfono reenvíe el lote (las repetidas se filtran solas) |
 
 ## Autenticación
 
@@ -105,12 +105,12 @@ producción dale un usuario propio (Redis 7 o posterior), limitado a sus llaves,
 a lo que hace con cada una y a los comandos que ejecuta:
 
 ```
-ACL SETUSER ingest on >CONTRASEÑA_LARGA resetkeys %RW~ingest:* %R~capture:active:* %W~capture:notifications resetchannels -@all +ping +get +set +incr +expire +eval +evalsha +xadd +client|setinfo
+ACL SETUSER ingest on >CONTRASEÑA_LARGA resetkeys %RW~ingest:* %R~capture:active:* %RW~capture:notifications resetchannels -@all +ping +get +set +incr +expire +eval +evalsha +xadd +client|setinfo
 ```
 
 - `%RW~ingest:*`: los contadores de los frenos (`INCR` y `EXPIRE` dentro de un script con `EVALSHA`, o `EVAL` la primera vez) y el filtro de repetidas (`SET NX`).
 - `%R~capture:active:*`: la lista de tokens de captura activos, solo lectura. Aunque alguien tomara el servicio, no podría dar de alta tokens.
-- `%W~capture:notifications`: el stream, solo escritura con `XADD` y `MAXLEN ~`; no puede leer las notificaciones de nadie. El patrón es exacto: la cola muerta `capture:notifications:dead` es de la API.
+- `%RW~capture:notifications`: el stream. `XADD` con `MAXLEN ~` cuenta como lectura y escritura para las ACL de Redis 7 (recorta al insertar), así que `%W` solo daría `NOPERM`; el usuario no tiene `XRANGE` ni `XREAD`, con lo que sigue sin poder leer las notificaciones de nadie. El patrón es exacto: la cola muerta `capture:notifications:dead` es de la API.
 - `PING` responde `/healthz`. `AUTH` y `HELLO` no necesitan permiso; `client|setinfo` es el saludo con que go-redis anuncia su versión (sin él todo funciona, pero cada conexión deja dos rechazos en `ACL LOG`).
 
 Luego `REDIS_URL=redis://ingest:CONTRASEÑA_LARGA@<host>:6379/0`. Con una base

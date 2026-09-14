@@ -94,12 +94,25 @@ func LoadDotEnv(path string) error {
 			continue
 		}
 		key = strings.TrimSpace(key)
-		value = strings.Trim(strings.TrimSpace(value), `"'`)
+		value = unquote(strings.TrimSpace(value))
 		if _, exists := os.LookupEnv(key); !exists {
 			_ = os.Setenv(key, value)
 		}
 	}
 	return nil
+}
+
+// unquote strips one pair of matching quotes, as dotenv does; a lone quote
+// or apostrophe inside a secret is part of it. Inline comments are not
+// supported: a `#` after the value stays in it, like in the API's loader.
+func unquote(value string) string {
+	if len(value) >= 2 {
+		first, last := value[0], value[len(value)-1]
+		if (first == '"' || first == '\'') && first == last {
+			return value[1 : len(value)-1]
+		}
+	}
+	return value
 }
 
 func env(key, fallback string) string {

@@ -82,6 +82,10 @@ type outcome struct {
 	Duplicate bool   `json:"duplicate"`
 	ID        string `json:"id,omitempty"`
 	Error     string `json:"error,omitempty"`
+	// Status is the code the item would have received on its own: 202
+	// queued, 200 duplicate, 400 invalid, 429 over the limit, 503 queue
+	// unavailable. The phone keeps and resends 429 and 503 items.
+	Status int `json:"status"`
 }
 
 type batchRequest struct {
@@ -89,11 +93,14 @@ type batchRequest struct {
 }
 
 type batchResponse struct {
-	Received   int       `json:"received"`
-	Queued     int       `json:"queued"`
-	Duplicates int       `json:"duplicates"`
-	Rejected   int       `json:"rejected"`
-	Results    []outcome `json:"results"`
+	Received   int `json:"received"`
+	Queued     int `json:"queued"`
+	Duplicates int `json:"duplicates"`
+	// Rejected items are invalid and should be dropped; Retry items hit a
+	// limit or an outage and should be sent again later.
+	Rejected int       `json:"rejected"`
+	Retry    int       `json:"retry"`
+	Results  []outcome `json:"results"`
 }
 
 // ── Handlers ──────────────────────────────────────────
@@ -144,19 +151,33 @@ func (s *Server) ingestBatch(w http.ResponseWriter, r *http.Request, userID stri
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), batchTimeout)
 	defer cancel()
 	resp := batchResponse{Received: len(b.Items), Results: make([]outcome, 0, len(b.Items))}
+	unavailable := false
 	for _, n := range b.Items {
 		code, out := s.ingest(ctx, userID, n)
+		out.Status = code
 		switch {
 		case code == http.StatusAccepted:
 			resp.Queued++
 		case out.Duplicate:
 			resp.Duplicates++
+		case code == http.StatusServiceUnavailable:
+			unavailable = true
+			resp.Retry++
+		case code == http.StatusTooManyRequests:
+			resp.Retry++
 		default:
 			resp.Rejected++
 		}
 		resp.Results = append(resp.Results, out)
 	}
-	writeJSON(w, http.StatusOK, resp)
+	// Items the queue could not take are not rejected: the whole batch
+	// answers 503 so the phone resends it, and the duplicate filter drops
+	// what did get in.
+	status := http.StatusOK
+	if unavailable {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, resp)
 }
 
 // ingest validates, rate-limits, filters repeats and enqueues one notification.

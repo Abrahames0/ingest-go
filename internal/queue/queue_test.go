@@ -27,6 +27,11 @@ func testRedis(t *testing.T) (*Redis, context.Context) {
 		r.Close()
 	})
 	if err := r.Ping(ctx); err != nil {
+		// CI sets REDIS_REQUIRED so a Redis that did not come up fails loudly
+		// instead of silently skipping the queue coverage.
+		if os.Getenv("REDIS_REQUIRED") != "" {
+			t.Fatalf("redis at REDIS_URL not reachable: %v", err)
+		}
 		t.Skipf("redis at REDIS_URL not reachable: %v", err)
 	}
 	return r, ctx
